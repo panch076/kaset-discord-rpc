@@ -23,6 +23,13 @@ if [[ ! "$CLIENT_ID" =~ '^[0-9]{17,20}$' ]]; then
   exit 1
 fi
 
+if ! xcode-select -p >/dev/null 2>&1 || ! xcrun --find swiftc >/dev/null 2>&1; then
+  echo "Apple's Command Line Tools are required to build the helper."
+  echo "Opening the installer — click Install, wait for it to finish, then run this script again."
+  xcode-select --install 2>/dev/null || true
+  exit 1
+fi
+
 mkdir -p "$SUPPORT" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 
 # Reuse an existing token so an already-added extension keeps working.

@@ -21,11 +21,19 @@ carry a random token generated at install time.
 
 ## Install
 
-1. Create a Discord application at <https://discord.com/developers/applications>.
+1. Install Apple's Command Line Tools if you don't have them (`install.sh` uses them to build the
+   helper). In Terminal, run:
+
+   ```
+   xcode-select --install
+   ```
+
+   and click **Install** in the dialog that appears. If it says they're already installed, you're set.
+2. Create a Discord application at <https://discord.com/developers/applications>.
    Its **name** is what shows after "Listening to" (e.g. `Kaset` or `YouTube Music`).
    Copy its **Application ID**.
-2. `./install.sh <application-id>`
-3. Kaset → Settings (⌘,) → Extensions → **+** → choose the `extension` folder → restart Kaset.
+3. `./install.sh <application-id>`
+4. Kaset → Settings (⌘,) → Extensions → **+** → choose the `extension` folder → restart Kaset.
 
 Discord must have *Settings → Activity Privacy → Share your detected activities* enabled.
 
