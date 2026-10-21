@@ -1,7 +1,7 @@
 # Kaset Discord Presence
 # THIS IS AI SLOP
 i made this for myself, solely using claude code so use at your own risk and dont complain
-yes i know ai is bad blah blah blah idc what you say i just wanted rpc and was lazy lol
+yes i know ai is bad blah blah blah idc what you say i just wanted an rpc and was lazy lol
 
 
 Shows what you're playing in [Kaset](https://github.com/sozercan/kaset) as Discord Rich Presence
