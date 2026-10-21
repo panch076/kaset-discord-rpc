@@ -33,8 +33,11 @@ carry a random token generated at install time.
 2. Create a Discord application at <https://discord.com/developers/applications>.
    Its **name** is what shows after "Listening to" (e.g. `Kaset` or `YouTube Music`).
    Copy its **Application ID**.
-3. `./install.sh <application-id>`
-4. Kaset → Settings (⌘,) → Extensions → **+** → choose the `extension` folder → restart Kaset.
+3. 
+```
+./install.sh <application-id>
+```
+5. Kaset → Settings (⌘,) → Extensions → **+** → choose the `extension` folder → restart Kaset.
 
 Discord must have *Settings → Activity Privacy → Share your detected activities* enabled.
 
