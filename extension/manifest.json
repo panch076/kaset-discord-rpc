@@ -1,0 +1,19 @@
+{
+  "manifest_version": 3,
+  "name": "Kaset Discord Presence",
+  "version": "1.0.0",
+  "description": "Shows what you're playing in Kaset as Discord Rich Presence.",
+  "background": {
+    "scripts": ["config.js", "background.js"],
+    "persistent": false
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://music.youtube.com/*", "https://www.youtube.com/*"],
+      "js": ["config.js", "content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
+    }
+  ],
+  "host_permissions": ["http://127.0.0.1/*"]
+}
