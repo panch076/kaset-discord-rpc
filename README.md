@@ -1,4 +1,7 @@
 # Kaset Discord Presence
+# THIS IS AI SLOP
+i made this for myself solely using claude so use at your own risk and dont complain
+yes i know ai is bad blah blah blah
 
 Shows what you're playing in [Kaset](https://github.com/sozercan/kaset) as Discord Rich Presence
 ("Listening to …" with title, artist, album art, progress bar, and a YouTube Music button).
