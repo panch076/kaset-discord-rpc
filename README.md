@@ -48,7 +48,9 @@ Edit `~/Library/Application Support/KasetDiscordPresence/config.json`, then
 
 - `clearOnPause` — `true` hides the presence while paused; `false` shows "Paused".
 - `statusDisplay` — what your status line shows after "Listening to": `"name"` (app name), `"artist"`, or `"title"`.
-- `lyrics` — show the current synced lyric line from [LRCLIB](https://lrclib.net). Discord rate-limits
+- `lyrics` — show the current synced lyric line from [LRCLIB](https://lrclib.net). Songs it can't provide
+  synced lyrics for, including while it's down, fall back to NetEase Cloud Music, which receives the title
+  and artist. Discord rate-limits
   activity updates (~5 per 20s), so updates are spaced at least 4s apart. Most songs show one line at
   a time. Fast songs (where more than 25% of lines would be skipped that way) show the lines sung
   since the last update together, ending with the line being sung now (`♪ previous line / current line`),

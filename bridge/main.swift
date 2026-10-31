@@ -19,7 +19,7 @@ struct Config: Codable {
     var clearOnPause: Bool?
     /// What Discord shows after "Listening to": "name" (app name), "artist" or "title".
     var statusDisplay: String?
-    /// Show the current synced lyric line (from LRCLIB) on the second line.
+    /// Show the current synced lyric line (from LRCLIB or NetEase) on the second line.
     var lyrics: Bool?
 }
 
@@ -236,7 +236,8 @@ struct NowPlaying: Decodable {
 
 // MARK: - Lyrics
 
-/// Fetches time-synced lyrics from LRCLIB (https://lrclib.net) and caches them per track.
+/// Fetches time-synced lyrics from LRCLIB (https://lrclib.net), falling back to NetEase
+/// Cloud Music when it is down or has no synced lyrics, and caches them per track.
 final class LyricsStore: @unchecked Sendable { // only mutated on `queue`
     struct Line {
         let time: Double
@@ -245,24 +246,45 @@ final class LyricsStore: @unchecked Sendable { // only mutated on `queue`
 
     private var cache: [String: [Line]] = [:] // empty = no synced lyrics found
     private var inFlight: Set<String> = []
+    private var retryAfter: [String: Date] = [:]
     var onLoaded: (() -> Void)?
+
+    /// A failed lookup says nothing about whether a song has lyrics, so it isn't cached.
+    private static let retryInterval: TimeInterval = 30
+
+    private static let session: URLSession = {
+        let config = URLSessionConfiguration.ephemeral
+        config.httpAdditionalHeaders = ["User-Agent": "KasetDiscordPresence/1.0 (https://github.com/sozercan/kaset)"]
+        config.timeoutIntervalForRequest = 10
+        // Once NetEase has set a cookie, its search returns unrelated songs.
+        config.httpCookieAcceptPolicy = .never
+        config.httpShouldSetCookies = false
+        config.httpCookieStorage = nil
+        return URLSession(configuration: config)
+    }()
 
     private static let bracketNoise = try! NSRegularExpression(
         pattern: #"\s*[\(\[][^\)\]]*\b(feat|ft|from|official|video|audio|lyrics?|remaster(ed)?|visualizer|explicit)\b[^\)\]]*[\)\]]"#,
         options: [.caseInsensitive]
     )
-    private static let timeTag = try! NSRegularExpression(pattern: #"\[(\d+):(\d+(?:\.\d+)?)\]"#)
+    private static let timeTag = try! NSRegularExpression(pattern: #"\[(\d+):(\d+(?:[.:]\d+)?)\]"#)
 
     /// Synced lyrics for the track, or nil if unavailable or still loading.
     func lines(for track: NowPlaying) -> [Line]? {
         let key = "\(track.title)\u{1F}\(track.artist ?? "")"
         if let lines = self.cache[key] { return lines.isEmpty ? nil : lines }
-        if !self.inFlight.contains(key) {
+        if !self.inFlight.contains(key), self.retryAfter[key] ?? .distantPast <= Date() {
             self.inFlight.insert(key)
             Task {
-                let lines = await Self.fetch(track)
+                let (lines, failed) = await Self.fetch(track)
                 queue.async {
                     self.inFlight.remove(key)
+                    if failed {
+                        self.retryAfter[key] = Date().addingTimeInterval(Self.retryInterval)
+                        log("Couldn't reach the lyrics services for \(track.title), retrying in \(Int(Self.retryInterval))s")
+                        return
+                    }
+                    self.retryAfter[key] = nil
                     self.cache[key] = lines
                     log(lines.isEmpty ? "No synced lyrics for \(track.title)" : "Loaded \(lines.count) lyric lines for \(track.title)")
                     if !lines.isEmpty { self.onLoaded?() }
@@ -288,39 +310,184 @@ final class LyricsStore: @unchecked Sendable { // only mutated on `queue`
         return result.trimmingCharacters(in: .whitespaces)
     }
 
-    private static func request(_ path: String, _ query: [String: String]) async -> Any? {
+    /// `failed` means the service couldn't answer, as opposed to not having the song.
+    private static func lrclib(_ path: String, _ query: [String: String]) async -> (json: Any?, failed: Bool) {
         var components = URLComponents(string: "https://lrclib.net/api/\(path)")!
         components.queryItems = query.map { URLQueryItem(name: $0.key, value: $0.value) }
-        var request = URLRequest(url: components.url!, timeoutInterval: 10)
-        request.setValue("KasetDiscordPresence/1.0 (https://github.com/sozercan/kaset)", forHTTPHeaderField: "User-Agent")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200
-        else { return nil }
-        return try? JSONSerialization.jsonObject(with: data)
+        guard let (data, response) = try? await session.data(from: components.url!),
+              let status = (response as? HTTPURLResponse)?.statusCode
+        else { return (nil, true) }
+        guard status == 200 else { return (nil, status >= 500 || status == 429) }
+        return (try? JSONSerialization.jsonObject(with: data), false)
     }
 
-    static func fetch(_ track: NowPlaying) async -> [Line] {
+    /// Lyrics for the track, and whether a service failure may have hidden some.
+    static func fetch(_ track: NowPlaying) async -> (lines: [Line], failed: Bool) {
         let title = cleanTitle(track.title)
         let artist = primaryArtist(track.artist ?? "")
         var query = ["track_name": title, "artist_name": artist]
         if let duration = track.duration, duration > 0 { query["duration"] = String(Int(duration.rounded())) }
 
-        if let exact = await request("get", query) as? [String: Any],
-           let synced = exact["syncedLyrics"] as? String {
-            return parse(synced)
+        let exact = await lrclib("get", query)
+        let exactRecord = exact.json as? [String: Any]
+        if let synced = exactRecord?["syncedLyrics"] as? String, !synced.isEmpty {
+            return (parse(synced), false)
         }
 
-        // Fall back to a search, preferring a result whose length matches.
-        let results = await request("search", ["track_name": title, "artist_name": artist]) as? [[String: Any]] ?? []
-        let synced = results.filter { $0["syncedLyrics"] is String }
-        let match = synced.first { result in
-            guard let duration = track.duration, duration > 0, let other = result["duration"] as? Double else { return false }
-            return abs(other - duration) <= 3
-        } ?? synced.first
-        return (match?["syncedLyrics"] as? String).map(parse) ?? []
+        var failed = exact.failed
+        var results: [[String: Any]] = []
+        if !failed {
+            // Fall back to a search, preferring a result whose length matches.
+            let search = await lrclib("search", ["track_name": title, "artist_name": artist])
+            failed = search.failed
+            results = search.json as? [[String: Any]] ?? []
+            let synced = results.filter { !($0["syncedLyrics"] as? String ?? "").isEmpty }
+            let match = synced.first { result in
+                guard let duration = track.duration, duration > 0, let other = result["duration"] as? Double else { return false }
+                return abs(other - duration) <= 3
+            } ?? synced.first
+            if let lrc = match?["syncedLyrics"] as? String { return (parse(lrc), false) }
+        }
+
+        if (exactRecord ?? results.first)?["instrumental"] as? Bool == true { return ([], false) }
+
+        let fallback = await netEase(track)
+        if let lrc = fallback.lrc {
+            log("Using NetEase lyrics for \(track.title)")
+            return (parse(lrc), false)
+        }
+        return ([], failed || fallback.failed)
     }
 
+    // MARK: Fallback (NetEase Cloud Music)
+
+    private struct NetEaseSong {
+        let id: Int
+        let name: String
+        let seconds: Double
+        let artists: [String]
+    }
+
+    /// The API is undocumented, so anything unexpected counts as a failure rather than "no lyrics".
+    private static func netEase(_ track: NowPlaying) async -> (lrc: String?, failed: Bool) {
+        var components = URLComponents(string: "https://music.163.com/api/search/get")!
+        components.queryItems = [
+            URLQueryItem(name: "s", value: "\(baseTitle(track.title)) \(primaryArtist(track.artist ?? ""))"),
+            URLQueryItem(name: "type", value: "1"),
+            URLQueryItem(name: "limit", value: "20"),
+        ]
+        guard let (data, response) = try? await session.data(from: components.url!),
+              (response as? HTTPURLResponse)?.statusCode == 200,
+              let found = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              found["code"] as? Int == 200
+        else { return (nil, true) }
+
+        let songs = ((found["result"] as? [String: Any])?["songs"] as? [[String: Any]] ?? []).compactMap { song -> NetEaseSong? in
+            guard let id = song["id"] as? Int, let name = song["name"] as? String,
+                  let milliseconds = song["duration"] as? Double,
+                  let artists = song["artists"] as? [[String: Any]]
+            else { return nil }
+            return NetEaseSong(id: id, name: name, seconds: milliseconds / 1000,
+                               artists: artists.compactMap { $0["name"] as? String })
+        }
+        // The closest match can have no lyrics while a re-release of it does.
+        for song in matches(for: track, in: songs).prefix(3) {
+            do {
+                if let lrc = try await netEaseLyrics(id: song.id) { return (lrc, false) }
+            } catch {
+                return (nil, true)
+            }
+        }
+        return (nil, false)
+    }
+
+    private static func netEaseLyrics(id: Int) async throws -> String? {
+        var components = URLComponents(string: "https://music.163.com/api/song/lyric")!
+        components.queryItems = [
+            URLQueryItem(name: "id", value: String(id)),
+            URLQueryItem(name: "lv", value: "1"),
+        ]
+        let (data, _) = try await session.data(from: components.url!)
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        guard let raw = (json?["lrc"] as? [String: Any])?["lyric"] as? String else { return nil }
+        let lrc = strippingCredits(raw)
+        // Unsynced lyrics come back with one placeholder timestamp, if any.
+        return Set(timedLines(lrc).map(\.time)).count >= 3 ? lrc : nil
+    }
+
+    /// Candidates that are really this recording, best first. A wrong song is
+    /// worse than none, so title, artist and length must all agree.
+    private static func matches(for track: NowPlaying, in songs: [NetEaseSong]) -> [NetEaseSong] {
+        let exactTitle = normalized(track.title)
+        let title = normalized(baseTitle(track.title))
+        let artist = normalized(primaryArtist(track.artist ?? ""))
+        guard !title.isEmpty, !artist.isEmpty else { return [] }
+        let isVersion = isDistinctVersion(track.title)
+
+        func isExact(_ song: NetEaseSong) -> Bool { normalized(song.name) == exactTitle }
+        func distance(_ song: NetEaseSong) -> Double {
+            guard let duration = track.duration, duration > 0 else { return 0 }
+            return abs(duration - song.seconds)
+        }
+        return songs
+            .filter { song in
+                song.artists.contains { normalized($0) == artist }
+                    && distance(song) < 15
+                    && (isExact(song) || (normalized(baseTitle(song.name)) == title
+                        && (isVersion || !isDistinctVersion(song.name))))
+            }
+            .sorted {
+                if isExact($0) != isExact($1) { return isExact($0) }
+                return distance($0) < distance($1)
+            }
+    }
+
+    /// The title without version tags, for comparing different releases of a song.
+    private static func baseTitle(_ title: String) -> String {
+        let keywords = "feat|ft\\.|with|remaster|version|edit|mix|live|mono|stereo|deluxe|bonus|explicit|official|video|audio|lyrics|visualizer"
+        var result = cleanTitle(title).replacingOccurrences(
+            of: "\\s*[\\(\\[][^\\)\\]]*(\(keywords))[^\\)\\]]*[\\)\\]]",
+            with: "", options: [.regularExpression, .caseInsensitive])
+        result = result.replacingOccurrences(
+            of: "\\s+-\\s+.*(\(keywords)).*$",
+            with: "", options: [.regularExpression, .caseInsensitive])
+        return result.trimmingCharacters(in: .whitespaces)
+    }
+
+    private static func normalized(_ text: String) -> String {
+        String(text.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil)
+            .unicodeScalars.filter(CharacterSet.alphanumerics.contains).map(Character.init))
+    }
+
+    /// Versions whose words or timing differ, unlike a remaster or an explicit tag.
+    private static func isDistinctVersion(_ title: String) -> Bool {
+        title.range(of: "\\b(remix|live|acoustic|instrumental|karaoke|cover|demo)\\b",
+                    options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    /// NetEase mixes credits in with the lyrics, e.g. "[00:00.00] 作词 : Someone".
+    private static func strippingCredits(_ lrc: String) -> String {
+        let credit = "^\\s*(\\p{Han}{1,10}\\s*[:：]\\s|(作词|作曲|编曲|词|曲|制作人|监制)\\s*[:：]"
+            + "|(artist|song|title|album|lyrics?|lyricist|composer|producer|arranger|written by)\\s*[:：]\\s"
+            + "|[\\p{L}&/ ]{1,30} [:：] )"
+        return lrc.components(separatedBy: .newlines).filter { line in
+            let text = line.replacingOccurrences(of: "^(\\[[^\\]]*\\])+", with: "", options: .regularExpression)
+            return text.range(of: credit, options: [.regularExpression, .caseInsensitive]) == nil
+        }.joined(separator: "\n")
+    }
+
+    // MARK: Parsing
+
     private static func parse(_ lrc: String) -> [Line] {
+        let sorted = timedLines(lrc)
+        let skipped = skippedFraction(sorted)
+        let fast = skipped > fastSongThreshold
+        log(String(format: "Lyrics: %.0f%% of lines would be skipped one at a time — %@", skipped * 100,
+                   fast ? "fast song, grouping lines" : "showing one line at a time"))
+        return fast ? chunked(sorted) : sorted
+    }
+
+    private static func timedLines(_ lrc: String) -> [Line] {
         var lines: [Line] = []
         for raw in lrc.components(separatedBy: .newlines) {
             let range = NSRange(raw.startIndex..., in: raw)
@@ -330,17 +497,12 @@ final class LyricsStore: @unchecked Sendable { // only mutated on `queue`
             if text.allSatisfy({ "♪♫♬".contains($0) }) { text = "" } // LRCLIB marks instrumental breaks with "♪"
             for tag in tags {
                 guard let minutes = Range(tag.range(at: 1), in: raw).flatMap({ Double(raw[$0]) }),
-                      let seconds = Range(tag.range(at: 2), in: raw).flatMap({ Double(raw[$0]) })
+                      let seconds = Range(tag.range(at: 2), in: raw).flatMap({ Double(raw[$0].replacingOccurrences(of: ":", with: ".")) })
                 else { continue }
                 lines.append(Line(time: minutes * 60 + seconds, text: text))
             }
         }
-        let sorted = lines.sorted { $0.time < $1.time }
-        let skipped = skippedFraction(sorted)
-        let fast = skipped > fastSongThreshold
-        log(String(format: "Lyrics: %.0f%% of lines would be skipped one at a time — %@", skipped * 100,
-                   fast ? "fast song, grouping lines" : "showing one line at a time"))
-        return fast ? chunked(sorted) : sorted
+        return lines.sorted { $0.time < $1.time }
     }
 
     /// Songs where more than this share of lines would be skipped one line at a time
@@ -581,8 +743,8 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--lyrics" {
                            artwork: nil, videoId: nil, playing: true, position: 0,
                            duration: args.count > 4 ? Double(args[4]) : nil)
     Task {
-        let chunks = await LyricsStore.fetch(track)
-        if chunks.isEmpty { print("No synced lyrics found") }
+        let (chunks, failed) = await LyricsStore.fetch(track)
+        if chunks.isEmpty { print(failed ? "Couldn't reach the lyrics services" : "No synced lyrics found") }
         for chunk in chunks {
             print(String(format: "%6.2f  ", chunk.time) + (chunk.text.isEmpty ? "♪" : "♪ \(chunk.text)"))
         }
